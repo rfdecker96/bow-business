@@ -2,7 +2,7 @@
 create table if not exists public.bow_products (
  id uuid primary key default gen_random_uuid(),
  name text not null check(length(name) between 1 and 90),
- tier text not null check(tier in ('baby','cutie','beautiful','extra')),
+ tier text not null check(tier in ('baby','cutie','beautiful','extra','everyday')),
  description text not null default '' check(length(description)<=500),
  image text not null,
  active boolean not null default true,
