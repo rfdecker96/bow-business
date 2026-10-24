@@ -19,7 +19,7 @@ function csrf(req,res,next){if(req.get('x-admin-csrf')!==req.session.csrf)return
 function cookie(req,value,maxAge){return `bow_admin=${value}; HttpOnly; SameSite=Strict; Path=/api/admin; Max-Age=${maxAge}${base(req).startsWith('https://')?'; Secure':''}`}
 function publicProduct(p){return {id:p.id,name:p.name,tier:p.tier,price:tiers[p.tier].price,unit:tiers[p.tier].unit,image:p.image,description:p.description||'',designs:p.designs||[]}}
 async function getProducts(){const {data,error}=await db.from('bow_products').select('*').order('created_at',{ascending:false});if(error)throw error;return data}
-async function getOrders(){const {data,error}=await db.from('bow_orders').select('*').order('created_at',{ascending:false}).limit(500);if(error)throw error;return data.map(o=>({id:o.id,sessionId:o.session_id,status:o.status,items:o.items,createdAt:o.created_at,email:o.email,shipping:o.shipping}))}
+async function getOrders(){const {data,error}=await db.from('bow_orders').select('*').order('created_at',{ascending:false}).limit(500);if(error)throw error;return data.map(o=>({id:o.id,sessionId:o.session_id,status:o.status,items:o.items,createdAt:o.created_at,email:o.email,shipping:o.shipping,productionStatus:o.production_status||'to_make',productionUpdatedAt:o.production_updated_at,trackingNumber:o.tracking_number||'',paidAt:o.paid_at}))}
 app.post('/api/stripe-webhook',express.raw({type:'application/json'}),async(req,res)=>{if(!stripe||!process.env.STRIPE_WEBHOOK_SECRET)return res.status(503).send('Webhook not configured');let event;try{event=stripe.webhooks.constructEvent(req.body,req.headers['stripe-signature'],process.env.STRIPE_WEBHOOK_SECRET)}catch{return res.status(400).send('Invalid signature')};try{if(event.type==='checkout.session.completed'&&event.data.object.payment_status==='paid'){const s=event.data.object;const {error}=await db.from('bow_orders').update({status:'paid',email:s.customer_details?.email||'',shipping:s.shipping_details||s.collected_information?.shipping_details||null,paid_at:new Date().toISOString()}).eq('session_id',s.id);if(error)throw error}res.json({received:true})}catch(e){fail(res,e)}});
 app.use(express.json({limit:'32kb'}));app.use(express.static(path.join(__dirname,'public'),{index:'index.html'}));
 app.get('/api/catalog',async(req,res)=>{if(!db)return fail(res,'Missing Supabase configuration',503);try{res.json({tiers,products:(await getProducts()).filter(p=>p.active&&tiers[p.tier]).map(publicProduct)})}catch(e){fail(res,e)}});
@@ -34,6 +34,28 @@ app.get('/api/admin/session',auth,(req,res)=>res.json({csrf:req.session.csrf}));
 app.post('/api/admin/logout',auth,origin,csrf,(req,res)=>{res.setHeader('Set-Cookie',cookie(req,'',0));res.json({ok:true})});
 app.get('/api/admin/products',auth,async(req,res)=>{if(!db)return fail(res,'Missing Supabase configuration',503);try{res.json({tiers,products:await getProducts()})}catch(e){fail(res,e)}});
 app.get('/api/admin/orders',auth,async(req,res)=>{if(!db)return fail(res,'Missing Supabase configuration',503);try{res.json({orders:await getOrders()})}catch(e){fail(res,e)}});
+// Production status is independent of Stripe payment status. Only paid orders can enter production.
+const productionStates=['to_make','making','ready_to_ship','shipped'];
+app.patch('/api/admin/orders/:id/production',auth,origin,csrf,async(req,res)=>{
+ if(!db)return res.status(503).json({error:'Missing Supabase configuration'});
+ const id=String(req.params.id||'');
+ if(!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/.test(id))return res.status(400).json({error:'Invalid order ID'});
+ const status=req.body?.productionStatus;
+ if(!productionStates.includes(status))return res.status(400).json({error:'Invalid production status'});
+ const tracking=String(req.body?.trackingNumber||'').trim();
+ if(tracking.length>120||(/[\r\n<>]/.test(tracking)))return res.status(400).json({error:'Invalid tracking number'});
+ try{
+  const {data:existing,error:lookupError}=await db.from('bow_orders').select('id,status,production_status').eq('id',id).maybeSingle();
+  if(lookupError)throw lookupError;
+  if(!existing)return res.status(404).json({error:'Order not found'});
+  if(existing.status!=='paid')return res.status(409).json({error:'Only paid orders can be updated'});
+  const {data,error}=await db.from('bow_orders').update({production_status:status,production_updated_at:new Date().toISOString(),tracking_number:status==='shipped'?tracking:''}).eq('id',id).eq('status','paid').select('id,production_status,tracking_number').maybeSingle();
+  if(error)throw error;
+  if(!data)return res.status(409).json({error:'Order status changed. Refresh and retry.'});
+  res.json({order:data});
+ }catch(e){fail(res,e)}
+});
+
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:5*1024*1024},fileFilter:(_req,file,cb)=>cb(null,['image/jpeg','image/png','image/webp'].includes(file.mimetype))});
 app.post('/api/admin/upload',auth,origin,csrf,(req,res)=>upload.single('image')(req,res,async err=>{if(err)return res.status(400).json({error:err.message});if(!req.file||!db)return res.status(400).json({error:'Choose a JPG, PNG or WebP image and configure Supabase'});const b=req.file.buffer,h=b.subarray(0,12),mime=req.file.mimetype;const valid=(mime==='image/jpeg'&&h[0]===255&&h[1]===216&&h[2]===255)||(mime==='image/png'&&h.subarray(0,8).equals(Buffer.from('89504e470d0a1a0a','hex')))||(mime==='image/webp'&&h.subarray(0,4).toString()==='RIFF'&&h.subarray(8,12).toString()==='WEBP');if(!valid)return res.status(400).json({error:'Invalid image file'});try{const name=crypto.randomUUID()+({'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp'}[mime]);const {error}=await db.storage.from('bow-images').upload(name,b,{contentType:mime,upsert:false});if(error)throw error;const {data}=db.storage.from('bow-images').getPublicUrl(name);res.json({image:data.publicUrl})}catch(e){fail(res,e)}}));
 function validate(body){const name=String(body.name||'').trim(),tier=String(body.tier||''),description=String(body.description||'').trim(),image=String(body.image||'');let validImage=false;try{const u=new URL(image);validImage=u.protocol==='https:'&&u.hostname===new URL(url).hostname&&u.pathname.startsWith('/storage/v1/object/public/bow-images/')}catch{validImage=/^\/media\/[\w.-]+$/.test(image)}if(!name||name.length>90||!tiers[tier]||description.length>500||!validImage)return null;

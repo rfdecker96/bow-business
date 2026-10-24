@@ -1,7 +1,42 @@
-const $=id=>document.getElementById(id),money=c=>'$'+(c/100).toFixed(2);let csrf='',tiers={},products=[],editing=null,image='',designs=[];const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const $=id=>document.getElementById(id),money=c=>'$'+(c/100).toFixed(2);let csrf='',tiers={},products=[],editing=null,image='',designs=[],orders=[];const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(url,options={}){const r=await fetch(url,{credentials:'same-origin',...options,headers:{...(options.body instanceof FormData?{}:{'Content-Type':'application/json'}),...(options.method&&options.method!=='GET'?{'x-admin-csrf':csrf}:{}),...options.headers}});const d=await r.json();if(!r.ok)throw Error(d.error||'Request failed');return d}
 function show(logged){$('login').classList.toggle('hidden',logged);$('dashboard').classList.toggle('hidden',!logged)}
-async function refresh(){const [a,b]=await Promise.all([api('/api/admin/products'),api('/api/admin/orders')]);tiers=a.tiers;products=a.products;$('tier').innerHTML=Object.entries(tiers).map(([id,t])=>`<option value="${id}">${esc(t.name)} (${money(t.price)}${id==='baby'?' per 3-pack':id==='everyday'?' or 2 for $5':''})</option>`).join('');$('product-list').innerHTML=products.map(p=>`<div class="admin-row"><img src="${esc(p.image)}" alt=""><div class="details"><strong>${esc(p.name)}</strong><div class="muted">${esc(tiers[p.tier]?.name||'Unknown')} · ${money(tiers[p.tier]?.price||0)} · ${p.active?'Visible':'Hidden'}</div></div><div><button data-edit="${p.id}">Edit</button><button data-hide="${p.id}">${p.active?'Hide':'Show'}</button><button data-delete="${p.id}" class="delete-bow">Delete</button></div></div>`).join('')||'<p>No bows added yet.</p>';$('order-list').innerHTML=b.orders.length?b.orders.map(o=>`<div class="admin-row"><div class="details"><strong>${esc(o.status.toUpperCase())}</strong> · ${esc(o.createdAt)}<div>${o.items.map(i=>esc(i.name)+(i.designName?' ('+esc(i.designName)+')':'')+' × '+i.quantity).join(', ')}</div><small>${esc(o.email||'Email pending')}</small></div></div>`).join(''):'<p>No orders yet.</p>';hint()}
+async function refresh(){const [a,b]=await Promise.all([api('/api/admin/products'),api('/api/admin/orders')]);tiers=a.tiers;products=a.products;$('tier').innerHTML=Object.entries(tiers).map(([id,t])=>`<option value="${id}">${esc(t.name)} (${money(t.price)}${id==='baby'?' per 3-pack':id==='everyday'?' or 2 for $5':''})</option>`).join('');$('product-list').innerHTML=products.map(p=>`<div class="admin-row"><img src="${esc(p.image)}" alt=""><div class="details"><strong>${esc(p.name)}</strong><div class="muted">${esc(tiers[p.tier]?.name||'Unknown')} · ${money(tiers[p.tier]?.price||0)} · ${p.active?'Visible':'Hidden'}</div></div><div><button data-edit="${p.id}">Edit</button><button data-hide="${p.id}">${p.active?'Hide':'Show'}</button><button data-delete="${p.id}" class="delete-bow">Delete</button></div></div>`).join('')||'<p>No bows added yet.</p>';orders=b.orders;renderOrders();hint()}
+
+const productionLabels={to_make:'To make',making:'Making',ready_to_ship:'Ready to ship',shipped:'Shipped'};
+function renderOrders(){
+ const paid=orders.filter(o=>o.status==='paid');
+ $('order-summary').innerHTML=Object.entries(productionLabels).map(([key,label])=>`<div class="order-stat"><strong>${paid.filter(o=>o.productionStatus===key).length}</strong><span>${label}</span></div>`).join('');
+ const filter=$('order-filter').value;
+ const visible=orders.filter(o=>filter==='all'||(filter==='active'?o.status==='paid'&&o.productionStatus!=='shipped':o.status==='paid'&&o.productionStatus===filter));
+ $('order-list').innerHTML=visible.map(o=>{
+ const paidOrder=o.status==='paid';
+ const items=Array.isArray(o.items)?o.items:[];
+ const lines=items.map(i=>`<li><strong>${esc(i.quantity)} × ${esc(i.name)}</strong>${i.designName?' — '+esc(i.designName):''}${i.tier==='baby'?' (3-pack)':''}</li>`).join('');
+ const address=o.shipping?.address||o.shipping?.shipping_details?.address||{};
+ const person=o.shipping?.name||o.shipping?.shipping_details?.name||'';
+ const shipping=[person,address.line1,address.line2,address.city,address.state,address.postal_code,address.country].filter(Boolean).map(esc).join(', ');
+ const options=Object.entries(productionLabels).map(([k,v])=>`<option value="${k}" ${o.productionStatus===k?'selected':''}>${v}</option>`).join('');
+ return `<article class="production-order" data-order="${esc(o.id)}"><div class="order-heading"><strong>Order ${esc(o.id.slice(0,8))}</strong><span>${esc(o.status.toUpperCase())} · ${esc(new Date(o.createdAt).toLocaleString())}</span></div><div><strong>Items to make</strong><ul>${lines}</ul></div><p><strong>Customer:</strong> ${esc(o.email||'Email pending')}</p><p><strong>Ship to:</strong> ${shipping||'Address pending'}</p>${paidOrder?`<div class="order-controls"><label>Production stage<select data-stage="${esc(o.id)}">${options}</select></label><label>Tracking (optional)<input data-tracking="${esc(o.id)}" maxlength="120" value="${esc(o.trackingNumber||'')}" placeholder="Tracking number"></label><button type="button" data-save-order="${esc(o.id)}">Save stage</button><button type="button" class="secondary" data-print-order="${esc(o.id)}">Print sheet</button></div>`:'<p class="muted">Not paid — excluded from production.</p>'}</article>`
+ }).join('')||'<p>No matching orders.</p>';
+}
+$('order-filter').onchange=renderOrders;
+$('order-list').addEventListener('click',async e=>{
+ const save=e.target.closest('[data-save-order]'),print=e.target.closest('[data-print-order]');
+ if(save){const id=save.dataset.saveOrder,card=save.closest('[data-order]'),stage=card.querySelector('[data-stage]').value,tracking=card.querySelector('[data-tracking]').value;
+  save.disabled=true;$('order-message').textContent='Saving production stage…';
+  try{await api('/api/admin/orders/'+encodeURIComponent(id)+'/production',{method:'PATCH',body:JSON.stringify({productionStatus:stage,trackingNumber:tracking})});$('order-message').textContent='Production stage saved.';await refresh()}
+  catch(err){$('order-message').textContent=err.message;save.disabled=false}return;
+ }
+ if(print){const order=orders.find(o=>o.id===print.dataset.printOrder);if(!order)return;
+  const w=window.open('','_blank','noopener,noreferrer,width=720,height=780');if(!w){alert('Allow popups to print the production sheet.');return}
+  const items=(order.items||[]).map(i=>`<li>${esc(i.quantity)} × ${esc(i.name)}${i.designName?' — '+esc(i.designName):''}</li>`).join('');
+  const address=order.shipping?.address||order.shipping?.shipping_details?.address||{};
+  const ship=[order.shipping?.name||order.shipping?.shipping_details?.name,address.line1,address.line2,address.city,address.state,address.postal_code,address.country].filter(Boolean).map(esc).join(', ');
+  w.document.write(`<!doctype html><html><head><title>Bow Business production sheet</title><meta charset="utf-8"><style>body{font:16px system-ui;margin:35px;line-height:1.6}h1{color:#a34b79}li{padding:7px}</style></head><body><h1>🎀 Bow Business · Production sheet</h1><p><b>Order:</b> ${esc(order.id)}</p><p><b>Stage:</b> ${esc(productionLabels[order.productionStatus]||'To make')}</p><h2>Make these bows</h2><ul>${items}</ul><h2>Ship to</h2><p>${ship||'Address pending'}</p><p>${esc(order.email||'')}</p><script>window.onload=()=>window.print()<\/script></body></html>`);w.document.close();
+ }
+});
+
 function hint(){$('price-hint').textContent='Price: '+money(tiers[$('tier').value]?.price||0)+($('tier').value==='baby'?' per 3-pack':$('tier').value==='everyday'?' each, or any 2 for $5':' per bow')}
 function renderDesigns(){ $('design-list').innerHTML=designs.map((d,i)=>`<div class="design-row"><img src="${esc(d.image||'')}" alt="" style="width:76px;height:76px;object-fit:contain" ${d.image?'':'hidden'}><label>Design name<input data-design-name="${i}" maxlength="70" value="${esc(d.name)}" placeholder="e.g. Pink Floral" required></label><label>Design photo<input type="file" accept="image/jpeg,image/png,image/webp" data-design-file="${i}"></label><button type="button" data-design-remove="${i}">Remove</button></div>`).join('')}
 $('add-design').onclick=()=>{designs.push({id:'d_'+crypto.randomUUID().replaceAll('-',''),name:'',image:''});renderDesigns()};
