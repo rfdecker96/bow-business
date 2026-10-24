@@ -1,0 +1,11 @@
+node_modules/
+.env
+data/
+public/uploads/
+node_modules/
+.env
+.env.*
+!.env.example
+.vercel/
+data/
+public/uploads/

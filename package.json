@@ -1,0 +1,21 @@
+{
+  "name": "bow-business",
+  "version": "3.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "check": "node --check server.js && node --check api/index.js && node --check public/admin.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "stripe": "^17.7.0",
+    "dotenv": "^16.4.7",
+    "multer": "2.0.2",
+    "bcryptjs": "^2.4.3",
+    "@supabase/supabase-js": "2.76.1"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}
