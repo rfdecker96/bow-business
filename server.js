@@ -42,9 +42,20 @@ async function handleStripeWebhook(req,res,stripe,signingSecret,mode){
  const supported=new Set(['checkout.session.completed','checkout.session.async_payment_succeeded','v1.checkout.session.completed','v1.checkout.session.async_payment_succeeded']);
  if(!supported.has(event.type))return res.json({received:true,ignored:true});
  try{
+  // Stripe snapshot events embed data.object. Thin v2.core.event notifications
+  // instead reference their resource through related_object, not data.object.
   const obj=event.data?.object||{};
-  const sessionId=typeof obj.id==='string'&&obj.id.startsWith('cs_')?obj.id:typeof obj.checkout_session==='string'?obj.checkout_session:null;
-  if(!sessionId)return res.status(400).send('Missing checkout session');
+  const candidates=[obj.id,obj.checkout_session,event.related_object?.id,event.data?.checkout_session];
+  let sessionId=candidates.find(id=>typeof id==='string'&&id.startsWith('cs_'));
+  if(!sessionId&&event.object==='v2.core.event'){
+   // Some thin notifications omit the related object from the delivery body.
+   // Fetch the authoritative event, then extract its Checkout Session reference.
+   if(!stripe.v2?.core?.events?.retrieve)return res.status(503).send('Stripe SDK does not support retrieving thin events; upgrade stripe dependency');
+   const fullEvent=await stripe.v2.core.events.retrieve(event.id);
+   const fullObj=fullEvent.data?.object||{};
+   sessionId=[fullEvent.related_object?.id,fullObj.id,fullObj.checkout_session].find(id=>typeof id==='string'&&id.startsWith('cs_'));
+  }
+  if(!sessionId)return res.status(422).send('Stripe event has no Checkout Session reference');
   // Restricted keys need Checkout Sessions read permission for this verification.
   const session=await stripe.checkout.sessions.retrieve(sessionId);
   if(session.livemode!==(mode==='live')||session.metadata?.payment_mode!==mode)return res.status(400).send('Checkout session mode mismatch');
