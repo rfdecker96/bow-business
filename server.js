@@ -6,7 +6,13 @@ const tiers={baby:{name:'Baby Barrets',price:250,unit:'3-pack'},cutie:{name:'Lit
 const url=process.env.SUPABASE_URL,key=process.env.SUPABASE_SECRET_KEY||process.env.SUPABASE_SERVICE_ROLE_KEY;
 const db=url&&key?createClient(url,key,{auth:{persistSession:false,autoRefreshToken:false}}):null;
 // Live checkout remains public. Sandbox checkout requires a valid admin session + CSRF.
-function configuredStripe(key, mode){return key?.startsWith(mode==='live'?'sk_live_':'sk_test_')&&!key.includes('replace_me')?Stripe(key):null}
+function configuredStripe(key, mode){
+  // Standard and restricted Stripe secret API keys are valid for their matching environment.
+  // Reject publishable keys, placeholders, and keys belonging to the other environment.
+  if(typeof key!=='string'||key.includes('replace_me'))return null;
+  const prefixes=mode==='live'?['sk_live_','rk_live_']:['sk_test_','rk_test_'];
+  return prefixes.some(prefix=>key.startsWith(prefix)&&key.length>prefix.length)?Stripe(key):null;
+}
 const liveStripe=configuredStripe(process.env.STRIPE_SECRET_KEY,'live');
 const testStripe=configuredStripe(process.env.STRIPE_TEST_SECRET_KEY,'test');
 const liveWebhookSecret=process.env.STRIPE_WEBHOOK_SECRET;
