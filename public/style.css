@@ -50,3 +50,26 @@
 
 /* v22: owner-managed featured and seasonal collections, real size details */
 .collection-pills{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0 18px}.collection-pills button{border:1px solid #e7b7ce;background:#fff8fb;border-radius:999px;padding:10px 15px;cursor:pointer;font:inherit;color:#783858}.collection-pills button.active{background:#873c63;color:white;border-color:#873c63}.collection-pills button:focus-visible{outline:3px solid #c96d9e;outline-offset:2px}.featured-tag{font-weight:800;color:#8b3c63}.bow-size,.bow-collection{font-size:.92rem;line-height:1.5;color:#75435d}.admin-card #size-info,.admin-card #seasonal-collection{max-width:100%}@media(max-width:600px){.collection-pills{flex-wrap:nowrap;overflow-x:auto;padding-bottom:8px}.collection-pills button{flex:0 0 auto}}
+
+/* v23 logo-based lavender, blush, ivory and plum brand refresh */
+:root{--pink:#f4b9d6;--rose:#a85c97;--deep:#744479;--cream:#fff9f5;--mint:#f1e2f3;--yellow:#fbe9d9;--ink:#50394f;--brand-lavender:#dcb4ef;--brand-blush:#f8d9e7;--brand-ivory:#fff8f0;--brand-plum:#744479}
+body{background:var(--cream);color:var(--ink)}
+.header{background:#fffafc;box-shadow:0 4px 22px #74447918}
+.header .logo{display:inline-flex;align-items:center;flex-shrink:0}
+.brand-logo{display:block;width:76px;height:76px;object-fit:contain;filter:drop-shadow(0 2px 4px #74447916)}
+.footer-brand img{display:block;margin:0 auto 10px;width:140px;height:140px;object-fit:contain}
+.topline,footer{background:var(--deep)}
+.bag,.product-content button,.qty button,.admin-row button{background:#f7e2ef}
+.hero-photo{background:#f8e1ee;box-shadow:12px 12px 0 #e8d6f3}
+.ribbon,.about{background:#f0e2f3;color:#65436b}
+.feature{background:#fbedf5}
+.feature img{box-shadow:none}
+.product,.help-card,.admin-card{border-color:#efd9e9}
+.product img,.videos video{background:#f6e6f1}
+.tier-pills button,.collection-pills button{border-color:#e8cbe6}
+.tier-pills button.active,.collection-pills button.active{background:var(--deep);border-color:var(--deep);color:#fff}
+.bundle-progress,.bundle-builder-summary{background:#fcf0f8;border-color:#ebc4df}
+.search-wrap input:focus,.field input:focus,.field textarea:focus,.field select:focus{outline:2px solid var(--rose);outline-offset:2px}
+.primary:focus-visible,.secondary:focus-visible,.bag:focus-visible,.tier-pills button:focus-visible{outline:3px solid #b884d7;outline-offset:3px}
+@media(max-width:850px){.brand-logo{width:62px;height:62px}}
+@media(max-width:560px){.brand-logo{width:54px;height:54px}.header{gap:10px}.footer-brand img{width:120px;height:120px}}
