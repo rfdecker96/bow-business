@@ -34,31 +34,66 @@ function cookie(req,value,maxAge){return `bow_admin=${value}; HttpOnly; SameSite
 function publicProduct(p){return {id:p.id,name:p.name,tier:p.tier,price:tiers[p.tier].price,unit:tiers[p.tier].unit,image:p.image,description:p.description||'',createdAt:p.created_at||'',designs:p.designs||[],attachments:p.attachments||[],sizeInfo:p.size_info||'',featured:p.featured===true,seasonalCollection:p.seasonal_collection||''}}
 async function getProducts(){const {data,error}=await db.from('bow_products').select('*').order('created_at',{ascending:false});if(error)throw error;return data}
 async function getOrders(){const {data,error}=await db.from('bow_orders').select('*').order('created_at',{ascending:false}).limit(500);if(error)throw error;return data.map(o=>({id:o.id,sessionId:o.session_id,status:o.status,items:o.items,createdAt:o.created_at,email:o.email,shipping:o.shipping,productionStatus:o.production_status||'to_make',productionUpdatedAt:o.production_updated_at,trackingNumber:o.tracking_number||'',productionNotes:o.production_notes||'',paymentMode:o.payment_mode||'live',isGift:o.is_gift||false,giftMessage:o.gift_message||'',paidAt:o.paid_at}))}
+// Reconcile against the authoritative Stripe Checkout Session, not only event payload snapshots.
 async function handleStripeWebhook(req,res,stripe,signingSecret,mode){
  if(!stripe||!signingSecret||!db)return res.status(503).send('Stripe environment not configured');
  let event;try{event=stripe.webhooks.constructEvent(req.body,req.headers['stripe-signature'],signingSecret)}catch{return res.status(400).send('Invalid signature')}
  if(event.livemode!==(mode==='live'))return res.status(400).send('Stripe event mode mismatch');
+ const supported=new Set(['checkout.session.completed','checkout.session.async_payment_succeeded','v1.checkout.session.completed','v1.checkout.session.async_payment_succeeded']);
+ if(!supported.has(event.type))return res.json({received:true,ignored:true});
  try{
-  if(event.type==='checkout.session.completed'&&event.data.object.payment_status==='paid'){
-   const session=event.data.object;
-   if(session.livemode!==(mode==='live')||session.metadata?.payment_mode!==mode)return res.status(400).send('Checkout session mode mismatch');
-   const {data,error}=await db.from('bow_orders').update({status:'paid',email:session.customer_details?.email||'',shipping:session.shipping_details||session.collected_information?.shipping_details||null,paid_at:new Date().toISOString()}).eq('session_id',session.id).eq('payment_mode',mode).eq('status','pending').select('id');
-   if(error)throw error;
-   if(!data?.length){const {data:existing,error:lookupError}=await db.from('bow_orders').select('id,status').eq('session_id',session.id).eq('payment_mode',mode).maybeSingle();if(lookupError)throw lookupError;if(!existing)return res.status(409).send('No matching checkout order')}
-  }
-  return res.json({received:true});
- }catch(e){return fail(res,e)}
+  const obj=event.data?.object||{};
+  const sessionId=typeof obj.id==='string'&&obj.id.startsWith('cs_')?obj.id:typeof obj.checkout_session==='string'?obj.checkout_session:null;
+  if(!sessionId)return res.status(400).send('Missing checkout session');
+  // Restricted keys need Checkout Sessions read permission for this verification.
+  const session=await stripe.checkout.sessions.retrieve(sessionId);
+  if(session.livemode!==(mode==='live')||session.metadata?.payment_mode!==mode)return res.status(400).send('Checkout session mode mismatch');
+  if(session.payment_status!=='paid')return res.json({received:true,paymentStatus:session.payment_status});
+  const {data:existing,error:lookupError}=await db.from('bow_orders').select('id,status').eq('session_id',session.id).eq('payment_mode',mode).maybeSingle();
+  if(lookupError)throw lookupError;
+  if(!existing)return res.status(409).send('No matching checkout order');
+  if(existing.status==='paid')return res.json({received:true,alreadyPaid:true});
+  if(existing.status!=='pending')return res.status(409).send('Unexpected order state');
+  const shipping=session.collected_information?.shipping_details||session.shipping_details||null;
+  const {data,error}=await db.from('bow_orders').update({status:'paid',email:session.customer_details?.email||session.customer_email||'',shipping,paid_at:new Date().toISOString()}).eq('id',existing.id).eq('session_id',session.id).eq('payment_mode',mode).eq('status','pending').select('id');
+  if(error)throw error;
+  if(!data?.length){const {data:updated,error:e}=await db.from('bow_orders').select('status').eq('id',existing.id).single();if(e||updated?.status!=='paid')return res.status(409).send('Order reconciliation conflict')}
+  return res.json({received:true,reconciled:true});
+ }catch(e){console.error('Stripe reconciliation failed:',e);return res.status(500).send('Reconciliation failed; retry delivery')}
 }
 app.post('/api/stripe-webhook',express.raw({type:'application/json'}),(req,res)=>handleStripeWebhook(req,res,liveStripe,liveWebhookSecret,'live'));
 app.post('/api/stripe-test-webhook',express.raw({type:'application/json'}),(req,res)=>handleStripeWebhook(req,res,testStripe,testWebhookSecret,'test'));
 app.use(express.json({limit:'32kb'}));app.use(express.static(path.join(__dirname,'public'),{index:'index.html'}));
 app.get('/api/catalog',async(req,res)=>{if(!db)return fail(res,'Missing Supabase configuration',503);try{res.json({tiers,products:(await getProducts()).filter(p=>p.active&&tiers[p.tier]).map(publicProduct)})}catch(e){fail(res,e)}});
 app.get('/api/config',(req,res)=>res.json({checkoutEnabled:liveReady,contactEmail:process.env.CONTACT_EMAIL||''}));
-async function createCheckout(req,res,stripe,mode){if(!stripe||!db)return res.status(503).json({error:'Checkout environment is not configured'});const items=req.body?.items;if(!Array.isArray(items)||items.length<1||items.length>30)return res.status(400).json({error:'Invalid cart'});const isGift=req.body?.isGift===true;const giftMessage=req.body?.giftMessage??'';if(typeof giftMessage!=='string'||giftMessage.length>300||(!isGift&&giftMessage.trim()))return res.status(400).json({error:'Invalid gift message'});try{const products=await getProducts(),line_items=[],snapshot=[];let everydayCount=0;
-for(const item of items){const p=products.find(p=>p.id===item.id&&p.active);if(!p||!tiers[p.tier]||!Number.isInteger(item.quantity)||item.quantity<1||item.quantity>20)return res.status(400).json({error:'Invalid item or quantity'});const t=tiers[p.tier];const designs=Array.isArray(p.designs)?p.designs:[];const chosen=designs.find(d=>d.id===item.designId);if(designs.length&&!chosen)return res.status(400).json({error:'Select a valid design for '+p.name});if(!designs.length&&item.designId)return res.status(400).json({error:'Unexpected design selection'});const designName=chosen?chosen.name:'';const available=Array.isArray(p.attachments)?p.attachments:[];const attachment=String(item.attachment||'');if(available.length&&!available.includes(attachment))return res.status(400).json({error:'Select a valid attachment for '+p.name});if(!available.length&&attachment)return res.status(400).json({error:'Unexpected attachment selection'});const attachmentName=attachment==='clip'?'Clip':attachment==='headband'?'Headband':'';if(p.tier==='everyday'){everydayCount+=item.quantity}else{line_items.push({price_data:{currency:'usd',product_data:{name:p.name+(designName?' — '+designName:'')+(attachmentName?' — '+attachmentName:'')+(p.tier==='baby'?' (3-pack)':'')},unit_amount:t.price},quantity:item.quantity})}snapshot.push({id:p.id,name:p.name,tier:p.tier,designId:chosen?.id||null,designName,attachment:attachment||null,attachmentName,designImage:chosen?.image||p.image,unitAmount:t.price,quantity:item.quantity})}
+// Packaging points approximate volume, not USPS ounces. Owner should calibrate with real parcels.
+const packingPoints={baby:1,everyday:1,cutie:2,beautiful:3,extra:4};
+const defaultShipping={small_max_units:3,medium_max_units:8,small_cents:995,medium_cents:1295,large_cents:1695,extra_step_units:8,extra_step_cents:400};
+function validateShipping(input){
+ const v={};for(const [k,defaultValue] of Object.entries(defaultShipping)){
+  const n=input[k];if(!Number.isInteger(n)||n<0||n>100000)throw Error('Invalid shipping setting: '+k);v[k]=n;
+ }
+ if(v.small_max_units<1||v.medium_max_units<=v.small_max_units||v.extra_step_units<1||v.small_cents<100||v.medium_cents<v.small_cents||v.large_cents<v.medium_cents)throw Error('Invalid shipping tiers');
+ return v;
+}
+async function getShippingSettings(){
+ const {data,error}=await db.from('bow_shipping_settings').select('*').eq('id',1).maybeSingle();
+ if(error){console.error('Shipping settings unavailable; using legacy fallback:',error.message);return null}
+ if(!data)return null;
+ return validateShipping(data);
+}
+function shippingForCart(units,settings){
+ if(!settings){const cents=Math.round(Number(process.env.SHIPPING_RATE_USD||'5')*100);if(!Number.isInteger(cents)||cents<0)throw Error('Invalid fallback shipping rate');return {cents,description:'Standard shipping (fallback)'}}
+ const c=units<=settings.small_max_units?settings.small_cents:units<=settings.medium_max_units?settings.medium_cents:settings.large_cents+Math.max(0,Math.ceil((units-settings.medium_max_units-settings.extra_step_units)/settings.extra_step_units))*settings.extra_step_cents;
+ return {cents:c,description:units<=settings.small_max_units?'Small package':units<=settings.medium_max_units?'Medium package':'Large package'};
+}
+app.get('/api/admin/shipping',auth,async(req,res)=>{try{const settings=await getShippingSettings();res.json({settings:settings||defaultShipping,fallback:!settings})}catch(e){fail(res,e)}});
+app.put('/api/admin/shipping',auth,origin,csrf,async(req,res)=>{if(!db)return res.status(503).json({error:'Database not configured'});let settings;try{settings=validateShipping(req.body)}catch(e){return res.status(400).json({error:e.message})}try{const {error}=await db.from('bow_shipping_settings').upsert({id:1,...settings,updated_at:new Date().toISOString()},{onConflict:'id'});if(error)throw error;res.json({settings})}catch(e){fail(res,e)}});
+async function createCheckout(req,res,stripe,mode){if(!stripe||!db)return res.status(503).json({error:'Checkout environment is not configured'});const items=req.body?.items;if(!Array.isArray(items)||items.length<1||items.length>30)return res.status(400).json({error:'Invalid cart'});const isGift=req.body?.isGift===true;const giftMessage=req.body?.giftMessage??'';if(typeof giftMessage!=='string'||giftMessage.length>300||(!isGift&&giftMessage.trim()))return res.status(400).json({error:'Invalid gift message'});try{const products=await getProducts(),line_items=[],snapshot=[];let everydayCount=0,packingUnits=0;
+for(const item of items){const p=products.find(p=>p.id===item.id&&p.active);if(!p||!tiers[p.tier]||!Number.isInteger(item.quantity)||item.quantity<1||item.quantity>20)return res.status(400).json({error:'Invalid item or quantity'});const t=tiers[p.tier];packingUnits+=(packingPoints[p.tier]||4)*item.quantity;const designs=Array.isArray(p.designs)?p.designs:[];const chosen=designs.find(d=>d.id===item.designId);if(designs.length&&!chosen)return res.status(400).json({error:'Select a valid design for '+p.name});if(!designs.length&&item.designId)return res.status(400).json({error:'Unexpected design selection'});const designName=chosen?chosen.name:'';const available=Array.isArray(p.attachments)?p.attachments:[];const attachment=String(item.attachment||'');if(available.length&&!available.includes(attachment))return res.status(400).json({error:'Select a valid attachment for '+p.name});if(!available.length&&attachment)return res.status(400).json({error:'Unexpected attachment selection'});const attachmentName=attachment==='clip'?'Clip':attachment==='headband'?'Headband':'';if(p.tier==='everyday'){everydayCount+=item.quantity}else{line_items.push({price_data:{currency:'usd',product_data:{name:p.name+(designName?' — '+designName:'')+(attachmentName?' — '+attachmentName:'')+(p.tier==='baby'?' (3-pack)':'')},unit_amount:t.price},quantity:item.quantity})}snapshot.push({id:p.id,name:p.name,tier:p.tier,designId:chosen?.id||null,designName,attachment:attachment||null,attachmentName,designImage:chosen?.image||p.image,unitAmount:t.price,quantity:item.quantity})}
 // Bundle all Everyday Cuties across different designs. Server calculates the discount.
 if(everydayCount){const pairs=Math.floor(everydayCount/2),single=everydayCount%2;if(pairs)line_items.push({price_data:{currency:'usd',product_data:{name:'Everyday Cuties — mix & match pair'},unit_amount:500},quantity:pairs});if(single)line_items.push({price_data:{currency:'usd',product_data:{name:'Everyday Cuties — single bow'},unit_amount:300},quantity:1})}
-const shipping=Math.round(Number(process.env.SHIPPING_RATE_USD||'5')*100);if(!Number.isInteger(shipping)||shipping<0)throw Error('Invalid shipping rate');const session=await stripe.checkout.sessions.create({mode:'payment',line_items,success_url:`${base(req)}/success.html?session_id={CHECKOUT_SESSION_ID}`,cancel_url:`${base(req)}/#shop`,shipping_address_collection:{allowed_countries:['US']},shipping_options:[{shipping_rate_data:{type:'fixed_amount',fixed_amount:{amount:shipping,currency:'usd'},display_name:'Standard shipping'}}],metadata:{store:'Bow Business',payment_mode:mode}});const {error}=await db.from('bow_orders').insert({session_id:session.id,status:'pending',payment_mode:mode,items:snapshot,is_gift:isGift,gift_message:isGift?giftMessage.trim():''});if(error)throw error;res.json({url:session.url})}catch(e){console.error('Checkout:',e);res.status(500).json({error:'Checkout could not be started'})}}
+const shippingInfo=shippingForCart(packingUnits,await getShippingSettings());const shipping=shippingInfo.cents;const session=await stripe.checkout.sessions.create({mode:'payment',line_items,success_url:`${base(req)}/success.html?session_id={CHECKOUT_SESSION_ID}`,cancel_url:`${base(req)}/#shop`,shipping_address_collection:{allowed_countries:['US']},shipping_options:[{shipping_rate_data:{type:'fixed_amount',fixed_amount:{amount:shipping,currency:'usd'},display_name:shippingInfo.description}}],metadata:{store:'Bow Business',payment_mode:mode}});const {error}=await db.from('bow_orders').insert({session_id:session.id,status:'pending',payment_mode:mode,items:snapshot,is_gift:isGift,gift_message:isGift?giftMessage.trim():''});if(error)throw error;res.json({url:session.url})}catch(e){console.error('Checkout:',e);res.status(500).json({error:'Checkout could not be started'})}}
 app.post('/api/create-checkout-session',(req,res)=>createCheckout(req,res,liveReady?liveStripe:null,'live'));
 app.post('/api/admin/sandbox-checkout',auth,origin,csrf,(req,res)=>createCheckout(req,res,testReady?testStripe:null,'test'));
 app.post('/api/admin/login',origin,(req,res)=>{if(!configured)return res.status(503).json({error:'Admin configuration invalid. Check username, password (12+ characters), and session secret (32+ characters).'});const u=String(req.body?.username||''),p=String(req.body?.password||'');const uOk=crypto.timingSafeEqual(crypto.createHash('sha256').update(u).digest(),crypto.createHash('sha256').update(adminUser).digest());const pOk=crypto.timingSafeEqual(crypto.createHash('sha256').update(p).digest(),crypto.createHash('sha256').update(adminPass).digest());if(!(uOk&&pOk))return res.status(401).json({error:'Invalid credentials'});const csrf=crypto.randomBytes(24).toString('hex'),payload=Buffer.from(JSON.stringify({csrf,exp:Date.now()+8*3600000})).toString('base64url');res.setHeader('Set-Cookie',cookie(req,payload+'.'+sign(payload),28800));res.json({csrf})});
