@@ -5,11 +5,15 @@ const app=express();app.disable('x-powered-by');app.set('trust proxy',1);
 const tiers={baby:{name:'Baby Barrets',price:250,unit:'3-pack'},cutie:{name:'Little Cutie',price:800,unit:'each'},beautiful:{name:'Bow Beautiful',price:1200,unit:'each'},extra:{name:'Extra Bow-tiful',price:1800,unit:'each'},everyday:{name:'Everyday Cuties',price:300,unit:'each',pairPrice:500}};
 const url=process.env.SUPABASE_URL,key=process.env.SUPABASE_SECRET_KEY||process.env.SUPABASE_SERVICE_ROLE_KEY;
 const db=url&&key?createClient(url,key,{auth:{persistSession:false,autoRefreshToken:false}}):null;
-const stripe=process.env.STRIPE_SECRET_KEY&&!process.env.STRIPE_SECRET_KEY.includes('replace_me')?Stripe(process.env.STRIPE_SECRET_KEY):null;
-const paymentMode=process.env.STRIPE_PAYMENT_MODE;
-if(!['test','live'].includes(paymentMode))console.warn('STRIPE_PAYMENT_MODE must be explicitly set to test or live before checkout/webhooks are enabled');
-const stripeKeyMode=process.env.STRIPE_SECRET_KEY?.startsWith('sk_test_')?'test':process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_')?'live':null;
-const stripeReady=!!stripe&&!!db&&!!process.env.STRIPE_WEBHOOK_SECRET&&['test','live'].includes(paymentMode)&&stripeKeyMode===paymentMode;
+// Live checkout remains public. Sandbox checkout requires a valid admin session + CSRF.
+function configuredStripe(key, mode){return key?.startsWith(mode==='live'?'sk_live_':'sk_test_')&&!key.includes('replace_me')?Stripe(key):null}
+const liveStripe=configuredStripe(process.env.STRIPE_SECRET_KEY,'live');
+const testStripe=configuredStripe(process.env.STRIPE_TEST_SECRET_KEY,'test');
+const liveWebhookSecret=process.env.STRIPE_WEBHOOK_SECRET;
+const testWebhookSecret=process.env.STRIPE_TEST_WEBHOOK_SECRET;
+const liveReady=!!db&&!!liveStripe&&!!liveWebhookSecret;
+const testReady=!!db&&!!testStripe&&!!testWebhookSecret;
+if(process.env.STRIPE_PAYMENT_MODE==='test')console.warn('v25 ignores legacy test mode: public checkout remains live only');
 const secret=process.env.SESSION_SECRET||'',adminUser=process.env.ADMIN_USERNAME||'',adminPass=process.env.ADMIN_PASSWORD||'';
 const configured=adminUser.trim()&&adminPass.length>=12&&!adminPass.includes('replace_')&&secret.length>=32;
 const base=(req)=>process.env.BASE_URL||`${req.protocol}://${req.get('host')}`;
@@ -24,30 +28,33 @@ function cookie(req,value,maxAge){return `bow_admin=${value}; HttpOnly; SameSite
 function publicProduct(p){return {id:p.id,name:p.name,tier:p.tier,price:tiers[p.tier].price,unit:tiers[p.tier].unit,image:p.image,description:p.description||'',createdAt:p.created_at||'',designs:p.designs||[],attachments:p.attachments||[],sizeInfo:p.size_info||'',featured:p.featured===true,seasonalCollection:p.seasonal_collection||''}}
 async function getProducts(){const {data,error}=await db.from('bow_products').select('*').order('created_at',{ascending:false});if(error)throw error;return data}
 async function getOrders(){const {data,error}=await db.from('bow_orders').select('*').order('created_at',{ascending:false}).limit(500);if(error)throw error;return data.map(o=>({id:o.id,sessionId:o.session_id,status:o.status,items:o.items,createdAt:o.created_at,email:o.email,shipping:o.shipping,productionStatus:o.production_status||'to_make',productionUpdatedAt:o.production_updated_at,trackingNumber:o.tracking_number||'',productionNotes:o.production_notes||'',paymentMode:o.payment_mode||'live',isGift:o.is_gift||false,giftMessage:o.gift_message||'',paidAt:o.paid_at}))}
-app.post('/api/stripe-webhook',express.raw({type:'application/json'}),async(req,res)=>{
- if(!stripeReady)return res.status(503).send('Stripe payment environment not configured');
- let event;try{event=stripe.webhooks.constructEvent(req.body,req.headers['stripe-signature'],process.env.STRIPE_WEBHOOK_SECRET)}catch{return res.status(400).send('Invalid signature')}
- if(event.livemode!==(paymentMode==='live'))return res.status(400).send('Stripe event mode mismatch');
+async function handleStripeWebhook(req,res,stripe,signingSecret,mode){
+ if(!stripe||!signingSecret||!db)return res.status(503).send('Stripe environment not configured');
+ let event;try{event=stripe.webhooks.constructEvent(req.body,req.headers['stripe-signature'],signingSecret)}catch{return res.status(400).send('Invalid signature')}
+ if(event.livemode!==(mode==='live'))return res.status(400).send('Stripe event mode mismatch');
  try{
   if(event.type==='checkout.session.completed'&&event.data.object.payment_status==='paid'){
-   const s=event.data.object;
-   if(s.livemode!==(paymentMode==='live'))return res.status(400).send('Checkout session mode mismatch');
-   const {data,error}=await db.from('bow_orders').update({status:'paid',email:s.customer_details?.email||'',shipping:s.shipping_details||s.collected_information?.shipping_details||null,paid_at:new Date().toISOString()}).eq('session_id',s.id).eq('payment_mode',paymentMode).eq('status','pending').select('id');
+   const session=event.data.object;
+   if(session.livemode!==(mode==='live')||session.metadata?.payment_mode!==mode)return res.status(400).send('Checkout session mode mismatch');
+   const {data,error}=await db.from('bow_orders').update({status:'paid',email:session.customer_details?.email||'',shipping:session.shipping_details||session.collected_information?.shipping_details||null,paid_at:new Date().toISOString()}).eq('session_id',session.id).eq('payment_mode',mode).eq('status','pending').select('id');
    if(error)throw error;
-   // Replayed events are acknowledged but never reapply a paid-order mutation.
-   if(!data?.length){const {data:existing,error:lookupError}=await db.from('bow_orders').select('id,status').eq('session_id',s.id).eq('payment_mode',paymentMode).maybeSingle();if(lookupError)throw lookupError;if(!existing)return res.status(409).send('No matching checkout order')}
+   if(!data?.length){const {data:existing,error:lookupError}=await db.from('bow_orders').select('id,status').eq('session_id',session.id).eq('payment_mode',mode).maybeSingle();if(lookupError)throw lookupError;if(!existing)return res.status(409).send('No matching checkout order')}
   }
-  res.json({received:true})
- }catch(e){fail(res,e)}
-});
+  return res.json({received:true});
+ }catch(e){return fail(res,e)}
+}
+app.post('/api/stripe-webhook',express.raw({type:'application/json'}),(req,res)=>handleStripeWebhook(req,res,liveStripe,liveWebhookSecret,'live'));
+app.post('/api/stripe-test-webhook',express.raw({type:'application/json'}),(req,res)=>handleStripeWebhook(req,res,testStripe,testWebhookSecret,'test'));
 app.use(express.json({limit:'32kb'}));app.use(express.static(path.join(__dirname,'public'),{index:'index.html'}));
 app.get('/api/catalog',async(req,res)=>{if(!db)return fail(res,'Missing Supabase configuration',503);try{res.json({tiers,products:(await getProducts()).filter(p=>p.active&&tiers[p.tier]).map(publicProduct)})}catch(e){fail(res,e)}});
-app.get('/api/config',(req,res)=>res.json({checkoutEnabled:stripeReady,contactEmail:process.env.CONTACT_EMAIL||''}));
-app.post('/api/create-checkout-session',async(req,res)=>{if(!stripeReady)return res.status(503).json({error:'Checkout environment is not configured'});const items=req.body?.items;if(!Array.isArray(items)||items.length<1||items.length>30)return res.status(400).json({error:'Invalid cart'});const isGift=req.body?.isGift===true;const giftMessage=req.body?.giftMessage??'';if(typeof giftMessage!=='string'||giftMessage.length>300||(!isGift&&giftMessage.trim()))return res.status(400).json({error:'Invalid gift message'});try{const products=await getProducts(),line_items=[],snapshot=[];let everydayCount=0;
+app.get('/api/config',(req,res)=>res.json({checkoutEnabled:liveReady,contactEmail:process.env.CONTACT_EMAIL||''}));
+async function createCheckout(req,res,stripe,mode){if(!stripe||!db)return res.status(503).json({error:'Checkout environment is not configured'});const items=req.body?.items;if(!Array.isArray(items)||items.length<1||items.length>30)return res.status(400).json({error:'Invalid cart'});const isGift=req.body?.isGift===true;const giftMessage=req.body?.giftMessage??'';if(typeof giftMessage!=='string'||giftMessage.length>300||(!isGift&&giftMessage.trim()))return res.status(400).json({error:'Invalid gift message'});try{const products=await getProducts(),line_items=[],snapshot=[];let everydayCount=0;
 for(const item of items){const p=products.find(p=>p.id===item.id&&p.active);if(!p||!tiers[p.tier]||!Number.isInteger(item.quantity)||item.quantity<1||item.quantity>20)return res.status(400).json({error:'Invalid item or quantity'});const t=tiers[p.tier];const designs=Array.isArray(p.designs)?p.designs:[];const chosen=designs.find(d=>d.id===item.designId);if(designs.length&&!chosen)return res.status(400).json({error:'Select a valid design for '+p.name});if(!designs.length&&item.designId)return res.status(400).json({error:'Unexpected design selection'});const designName=chosen?chosen.name:'';const available=Array.isArray(p.attachments)?p.attachments:[];const attachment=String(item.attachment||'');if(available.length&&!available.includes(attachment))return res.status(400).json({error:'Select a valid attachment for '+p.name});if(!available.length&&attachment)return res.status(400).json({error:'Unexpected attachment selection'});const attachmentName=attachment==='clip'?'Clip':attachment==='headband'?'Headband':'';if(p.tier==='everyday'){everydayCount+=item.quantity}else{line_items.push({price_data:{currency:'usd',product_data:{name:p.name+(designName?' — '+designName:'')+(attachmentName?' — '+attachmentName:'')+(p.tier==='baby'?' (3-pack)':'')},unit_amount:t.price},quantity:item.quantity})}snapshot.push({id:p.id,name:p.name,tier:p.tier,designId:chosen?.id||null,designName,attachment:attachment||null,attachmentName,designImage:chosen?.image||p.image,unitAmount:t.price,quantity:item.quantity})}
 // Bundle all Everyday Cuties across different designs. Server calculates the discount.
 if(everydayCount){const pairs=Math.floor(everydayCount/2),single=everydayCount%2;if(pairs)line_items.push({price_data:{currency:'usd',product_data:{name:'Everyday Cuties — mix & match pair'},unit_amount:500},quantity:pairs});if(single)line_items.push({price_data:{currency:'usd',product_data:{name:'Everyday Cuties — single bow'},unit_amount:300},quantity:1})}
-const shipping=Math.round(Number(process.env.SHIPPING_RATE_USD||'5')*100);if(!Number.isInteger(shipping)||shipping<0)throw Error('Invalid shipping rate');const session=await stripe.checkout.sessions.create({mode:'payment',line_items,success_url:`${base(req)}/success.html?session_id={CHECKOUT_SESSION_ID}`,cancel_url:`${base(req)}/#shop`,shipping_address_collection:{allowed_countries:['US']},shipping_options:[{shipping_rate_data:{type:'fixed_amount',fixed_amount:{amount:shipping,currency:'usd'},display_name:'Standard shipping'}}],metadata:{store:'Bow Business',payment_mode:paymentMode}});const {error}=await db.from('bow_orders').insert({session_id:session.id,status:'pending',payment_mode:paymentMode,items:snapshot,is_gift:isGift,gift_message:isGift?giftMessage.trim():''});if(error)throw error;res.json({url:session.url})}catch(e){console.error('Checkout:',e);res.status(500).json({error:'Checkout could not be started'})}});
+const shipping=Math.round(Number(process.env.SHIPPING_RATE_USD||'5')*100);if(!Number.isInteger(shipping)||shipping<0)throw Error('Invalid shipping rate');const session=await stripe.checkout.sessions.create({mode:'payment',line_items,success_url:`${base(req)}/success.html?session_id={CHECKOUT_SESSION_ID}`,cancel_url:`${base(req)}/#shop`,shipping_address_collection:{allowed_countries:['US']},shipping_options:[{shipping_rate_data:{type:'fixed_amount',fixed_amount:{amount:shipping,currency:'usd'},display_name:'Standard shipping'}}],metadata:{store:'Bow Business',payment_mode:mode}});const {error}=await db.from('bow_orders').insert({session_id:session.id,status:'pending',payment_mode:mode,items:snapshot,is_gift:isGift,gift_message:isGift?giftMessage.trim():''});if(error)throw error;res.json({url:session.url})}catch(e){console.error('Checkout:',e);res.status(500).json({error:'Checkout could not be started'})}}
+app.post('/api/create-checkout-session',(req,res)=>createCheckout(req,res,liveReady?liveStripe:null,'live'));
+app.post('/api/admin/sandbox-checkout',auth,origin,csrf,(req,res)=>createCheckout(req,res,testReady?testStripe:null,'test'));
 app.post('/api/admin/login',origin,(req,res)=>{if(!configured)return res.status(503).json({error:'Admin configuration invalid. Check username, password (12+ characters), and session secret (32+ characters).'});const u=String(req.body?.username||''),p=String(req.body?.password||'');const uOk=crypto.timingSafeEqual(crypto.createHash('sha256').update(u).digest(),crypto.createHash('sha256').update(adminUser).digest());const pOk=crypto.timingSafeEqual(crypto.createHash('sha256').update(p).digest(),crypto.createHash('sha256').update(adminPass).digest());if(!(uOk&&pOk))return res.status(401).json({error:'Invalid credentials'});const csrf=crypto.randomBytes(24).toString('hex'),payload=Buffer.from(JSON.stringify({csrf,exp:Date.now()+8*3600000})).toString('base64url');res.setHeader('Set-Cookie',cookie(req,payload+'.'+sign(payload),28800));res.json({csrf})});
 app.get('/api/admin/session',auth,(req,res)=>res.json({csrf:req.session.csrf}));
 app.post('/api/admin/logout',auth,origin,csrf,(req,res)=>{res.setHeader('Set-Cookie',cookie(req,'',0));res.json({ok:true})});
